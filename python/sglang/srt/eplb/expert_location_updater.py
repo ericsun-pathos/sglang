@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
 import torch
@@ -45,6 +45,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        sync_transfer_boundary: Optional[Callable[[str, int], None]] = None,
     ):
         """
         Update experts' physical location after EPLB.
@@ -66,6 +67,7 @@ class ExpertLocationUpdater:
             update_layer_ids=update_layer_ids,
             nnodes=nnodes,
             rank=rank,
+            sync_transfer_boundary=sync_transfer_boundary,
         )
         old_expert_location_metadata.update(
             new_expert_location_metadata,
@@ -90,6 +92,7 @@ def _update_expert_weights_with_canary(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    sync_transfer_boundary: Optional[Callable[[str, int], None]] = None,
 ):
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
 
@@ -117,6 +120,7 @@ def _update_expert_weights_with_canary(
         update_layer_ids=update_layer_ids,
         nnodes=nnodes,
         rank=rank,
+        sync_transfer_boundary=sync_transfer_boundary,
     )
 
     for layer_id in update_layer_ids:
@@ -139,6 +143,7 @@ def _update_expert_weights_raw(
     update_layer_ids: List[int],
     nnodes: int,
     rank: int,
+    sync_transfer_boundary: Optional[Callable[[str, int], None]] = None,
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
@@ -154,6 +159,8 @@ def _update_expert_weights_raw(
 
     for layer_id in update_layer_ids:
         missing_logical_experts_info: List[int] = []
+        if sync_transfer_boundary is not None:
+            sync_transfer_boundary("before", layer_id)
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
@@ -170,6 +177,8 @@ def _update_expert_weights_raw(
             missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
         )
+        if sync_transfer_boundary is not None:
+            sync_transfer_boundary("after", layer_id)
         if len(missing_logical_experts_info) > 0:
             missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
     return missing_logical_experts_by_layers

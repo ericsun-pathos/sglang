@@ -1475,6 +1475,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
+            sync_transfer_boundary=self._sync_eplb_transfer_boundary,
         )
 
         if len(p2p_missing_logical_experts) > 0:
@@ -1505,6 +1506,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+    def _sync_eplb_transfer_boundary(self, _phase: str, _layer_id: int):
+        if self.tp_size <= 1:
+            return
+
+        # EPLB uses NCCL P2P while the normal forward path uses NCCL collectives.
+        # Synchronize device work, then rendezvous on the CPU group so all TP
+        # ranks enter and leave each EPLB layer transfer in the same phase.
+        torch.get_device_module().synchronize()
+        self.tp_group.barrier()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
