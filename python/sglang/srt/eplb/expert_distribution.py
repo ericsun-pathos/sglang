@@ -709,6 +709,10 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
+        # EPLB may enter a CPU-process-group barrier immediately after the
+        # forward pass. Wait on this tiny NCCL reduce on every rank so non-dst
+        # ranks do not block in the CPU barrier while rank 0 is still syncing it.
+        gpu_physical_count_sum = gpu_physical_count.sum().item()
 
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
@@ -725,8 +729,6 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
                 self._history.append(utilization_rate_cpu)
-
-                gpu_physical_count_sum = gpu_physical_count.sum().item()
 
                 logger.info(
                     f"[Expert Balancedness] "
