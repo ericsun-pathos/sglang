@@ -1512,9 +1512,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         # EPLB uses NCCL P2P while the normal forward path uses NCCL collectives.
-        # Synchronize device work, then rendezvous on the CPU group so all TP
-        # ranks enter and leave each EPLB layer transfer in the same phase.
-        torch.get_device_module().synchronize()
+        # Rendezvous on the CPU group so all TP ranks enter and leave each EPLB
+        # layer transfer in the same phase without inserting a device-wide CUDA
+        # sync into the hot path.
         self.tp_group.barrier()
 
     def maybe_recover_ep_ranks(self):
