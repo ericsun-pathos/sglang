@@ -478,6 +478,10 @@ def update_expert_weights_single_layer(
         ), "Broadcast EPLB transfer does not support elastic EP recovery."
 
         local_old_locations = _compute_local_old_locations()
+        dummy_broadcast_buffers = [
+            torch.empty_like(_get_tensor(temp_buffers, i, local_expert_location_range[0]))
+            for i in range(num_tensors)
+        ]
         local_temp_copy_infos: List[Tuple[int, int]] = []
         remote_recv_infos: Dict[int, List[int]] = defaultdict(list)
 
@@ -510,8 +514,10 @@ def update_expert_weights_single_layer(
                     tensor = _get_tensor(
                         routed_experts_weights, i, src_expert_location
                     )
-                else:
+                elif len(recv_expert_locations) > 0:
                     tensor = _get_tensor(temp_buffers, i, recv_expert_location)
+                else:
+                    tensor = dummy_broadcast_buffers[i]
                 torch.distributed.broadcast(tensor, src=src_rank)
 
             for dst_expert_location in recv_expert_locations:
