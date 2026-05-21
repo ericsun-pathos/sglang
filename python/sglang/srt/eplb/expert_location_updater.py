@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
+_USE_BROADCAST_TRANSFER = get_bool_env_var(
+    "SGLANG_EXPERT_LOCATION_UPDATER_USE_BROADCAST"
+)
 
 
 class ExpertLocationUpdater:
@@ -239,19 +242,25 @@ def update_expert_weights_single_layer(
         # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
-        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
-        _create_isend_ops(p2p_op_infos)
-        _filter_p2p_ops(p2p_op_infos)
-        _execute_p2p_ops(p2p_op_infos)
+        if _USE_BROADCAST_TRANSFER:
+            _execute_broadcast_transfer(buffer2weight_copy_infos)
+        else:
+            _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
+            _create_isend_ops(p2p_op_infos)
+            _filter_p2p_ops(p2p_op_infos)
+            _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
-            _log_p2p_op_metrics(
-                p2p_op_infos,
-                world_size=world_size,
-                num_gpu_per_node=num_gpu_per_node,
-                self_node_id=self_node_id,
-            )
+            if _USE_BROADCAST_TRANSFER:
+                logger.info("[ExpertLocationUpdater] using_broadcast_transfer=True")
+            else:
+                _log_p2p_op_metrics(
+                    p2p_op_infos,
+                    world_size=world_size,
+                    num_gpu_per_node=num_gpu_per_node,
+                    self_node_id=self_node_id,
+                )
 
         if debug:
             output_logs.append(f"{p2p_op_infos=}")
@@ -462,6 +471,95 @@ def update_expert_weights_single_layer(
         )
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
+
+    def _execute_broadcast_transfer(buffer2weight_copy_infos):
+        assert (
+            ElasticEPStateManager.instance() is None
+        ), "Broadcast EPLB transfer does not support elastic EP recovery."
+
+        local_old_locations = _compute_local_old_locations()
+        local_temp_copy_infos: List[Tuple[int, int]] = []
+        remote_recv_infos: Dict[int, List[int]] = defaultdict(list)
+
+        for dst_expert_location in range(*local_expert_location_range):
+            logical_expert_id = new_physical_to_logical_map[dst_expert_location]
+
+            if old_physical_to_logical_map[dst_expert_location] == logical_expert_id:
+                continue
+
+            local_src_expert_location = local_old_locations.get(logical_expert_id)
+            if local_src_expert_location is not None:
+                local_temp_copy_infos.append(
+                    (local_src_expert_location, dst_expert_location)
+                )
+            else:
+                remote_recv_infos[logical_expert_id].append(dst_expert_location)
+
+        for logical_expert_id in _compute_broadcast_logical_expert_ids():
+            src_expert_location = _get_first_old_expert_location(logical_expert_id)
+            src_rank = src_expert_location // num_local_physical_experts
+            recv_expert_locations = remote_recv_infos.get(logical_expert_id, [])
+            recv_expert_location = (
+                recv_expert_locations[0]
+                if len(recv_expert_locations) > 0
+                else local_expert_location_range[0]
+            )
+
+            for i in range(num_tensors):
+                if rank == src_rank:
+                    tensor = _get_tensor(
+                        routed_experts_weights, i, src_expert_location
+                    )
+                else:
+                    tensor = _get_tensor(temp_buffers, i, recv_expert_location)
+                torch.distributed.broadcast(tensor, src=src_rank)
+
+            for dst_expert_location in recv_expert_locations:
+                buffer2weight_copy_infos.append(
+                    (recv_expert_location, dst_expert_location)
+                )
+
+        for src_expert_location, dst_expert_location in local_temp_copy_infos:
+            for i in range(num_tensors):
+                _get_tensor(temp_buffers, i, dst_expert_location).copy_(
+                    _get_tensor(routed_experts_weights, i, src_expert_location)
+                )
+            buffer2weight_copy_infos.append(
+                (dst_expert_location, dst_expert_location)
+            )
+
+    def _compute_local_old_locations() -> Dict[int, int]:
+        ans: Dict[int, int] = {}
+        for expert_location in range(*local_expert_location_range):
+            logical_expert_id = old_physical_to_logical_map[expert_location]
+            ans.setdefault(logical_expert_id, expert_location)
+        return ans
+
+    def _compute_broadcast_logical_expert_ids() -> List[int]:
+        logical_expert_ids = set()
+        for dst_expert_location, logical_expert_id in enumerate(
+            new_physical_to_logical_map
+        ):
+            dst_rank = dst_expert_location // num_local_physical_experts
+            if not _rank_has_old_logical_expert(dst_rank, logical_expert_id):
+                logical_expert_ids.add(logical_expert_id)
+        return sorted(logical_expert_ids)
+
+    def _rank_has_old_logical_expert(rank_index: int, logical_expert_id: int) -> bool:
+        start = rank_index * num_local_physical_experts
+        end = start + num_local_physical_experts
+        return any(
+            old_physical_to_logical_map[x] == logical_expert_id
+            for x in range(start, end)
+        )
+
+    def _get_first_old_expert_location(logical_expert_id: int) -> int:
+        for expert_location, old_logical_expert_id in enumerate(
+            old_physical_to_logical_map
+        ):
+            if old_logical_expert_id == logical_expert_id:
+                return expert_location
+        raise AssertionError(f"Cannot find old location for {logical_expert_id=}")
 
     def _filter_p2p_ops(p2p_op_infos):
         elastic_ep_state = ElasticEPStateManager.instance()
