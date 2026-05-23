@@ -6,7 +6,10 @@ import torch
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+    fused_marlin_moe,
+    fused_marlin_moe_ep_packed,
+)
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
@@ -435,6 +438,95 @@ class TestFusedMarlinMoe(CustomTestCase):
                     torch.testing.assert_close(
                         marlin_output, torch_output, atol=5e-2, rtol=0
                     )
+
+    def test_fused_marlin_moe_ep_packed(self):
+        torch.manual_seed(101)
+
+        local_e = 4
+        max_m = 17
+        n, k = 256, 256
+        group_size = 128
+        dtype = torch.bfloat16
+        quant_type = scalar_types.uint4b8
+
+        masked_m = torch.tensor([0, 5, 13, 17], device="cuda", dtype=torch.int32)
+        hidden_states = (
+            torch.randn((local_e, max_m, k), device="cuda", dtype=dtype) / 10
+        )
+        w1 = torch.randn((local_e, 2 * n, k), device="cuda", dtype=dtype) / 20
+        w2 = torch.randn((local_e, k, n), device="cuda", dtype=dtype) / 20
+
+        w_ref1_l, qweight1_l, scales1_l = [], [], []
+        for i in range(local_e):
+            test_perm = torch.randperm(k)
+            w_ref1, qweight1, scales1, _, _, _ = marlin_quantize(
+                w1[i].transpose(1, 0),
+                quant_type,
+                group_size,
+                False,
+                test_perm,
+            )
+            w_ref1_l.append(w_ref1.T)
+            qweight1_l.append(qweight1)
+            scales1_l.append(scales1)
+
+        w_ref2_l, qweight2_l, scales2_l = [], [], []
+        for i in range(local_e):
+            test_perm = torch.randperm(n)
+            w_ref2, qweight2, scales2, _, _, _ = marlin_quantize(
+                w2[i].transpose(1, 0),
+                quant_type,
+                group_size,
+                False,
+                test_perm,
+            )
+            w_ref2_l.append(w_ref2.T)
+            qweight2_l.append(qweight2)
+            scales2_l.append(scales2)
+
+        w_ref1 = stack_and_dev(w_ref1_l)
+        qweight1 = stack_and_dev(qweight1_l).contiguous()
+        scales1 = stack_and_dev(scales1_l)
+
+        w_ref2 = stack_and_dev(w_ref2_l)
+        qweight2 = stack_and_dev(qweight2_l).contiguous()
+        scales2 = stack_and_dev(scales2_l)
+
+        actual = fused_marlin_moe_ep_packed(
+            hidden_states=hidden_states,
+            masked_m=masked_m,
+            w1=qweight1,
+            w2=qweight2,
+            w1_scale=scales1,
+            w2_scale=scales2,
+            num_bits=4,
+            is_k_full=True,
+        )
+
+        reference = torch.empty_like(actual)
+        silu_and_mul = SiluAndMul()
+        for expert_id in range(local_e):
+            num_tokens = int(masked_m[expert_id].item())
+            if num_tokens == 0:
+                continue
+            gateup = hidden_states[expert_id, :num_tokens] @ w_ref1[
+                expert_id
+            ].transpose(0, 1)
+            down_input = silu_and_mul(gateup)
+            reference[expert_id, :num_tokens] = down_input @ w_ref2[
+                expert_id
+            ].transpose(0, 1)
+
+        for expert_id in range(local_e):
+            num_tokens = int(masked_m[expert_id].item())
+            if num_tokens == 0:
+                continue
+            torch.testing.assert_close(
+                actual[expert_id, :num_tokens],
+                reference[expert_id, :num_tokens],
+                atol=5e-2,
+                rtol=0,
+            )
 
 
 if __name__ == "__main__":

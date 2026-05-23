@@ -16,6 +16,8 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
+        NixlEPCombineInput,
+        NixlEPDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -141,4 +143,91 @@ def fused_experts_none_to_marlin(
 
     return StandardCombineInput(
         hidden_states=output,
+    )
+
+
+@register_fused_func("nixl", "marlin")
+def fused_experts_nixl_to_marlin(
+    dispatch_output: NixlEPDispatchOutput,
+    quant_info: MarlinMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> NixlEPCombineInput:
+    global MARLIN_MOE_WORKSPACE
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        fused_marlin_moe_ep_packed,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPCombineInput
+    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+
+    assert runner_config.activation == "silu", "Only SiLU activation is supported."
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        masked_m,
+        _,
+    ) = dispatch_output
+
+    if hidden_states_scale is not None:
+        raise NotImplementedError(
+            "NIXL + Marlin only supports BF16/FP16 dispatched activations. "
+            "Set SGLANG_NIXL_EP_BF16_DISPATCH=1 to disable FP8 NIXL dispatch."
+        )
+    assert hidden_states.ndim == 3, (
+        "NIXL + Marlin expects packed hidden_states with shape "
+        "[num_local_experts, max_tokens_per_expert, hidden_size], "
+        f"got {tuple(hidden_states.shape)}"
+    )
+
+    if (
+        MARLIN_MOE_WORKSPACE is None
+        or MARLIN_MOE_WORKSPACE.device != hidden_states.device
+    ):
+        MARLIN_MOE_WORKSPACE = marlin_make_workspace(
+            hidden_states.device, max_blocks_per_sm=4
+        )
+
+    marlin_hidden_states = hidden_states.contiguous()
+    original_dtype = marlin_hidden_states.dtype
+    if (
+        quant_info.weight_bits == 4
+        and quant_info.w13_qzeros is None
+        and quant_info.w2_qzeros is None
+        and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
+        and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
+        and marlin_hidden_states.dtype == torch.float16
+    ):
+        marlin_hidden_states = marlin_hidden_states.to(torch.bfloat16)
+
+    output = fused_marlin_moe_ep_packed(
+        hidden_states=marlin_hidden_states,
+        masked_m=masked_m,
+        w1=quant_info.w13_qweight,
+        w2=quant_info.w2_qweight,
+        w1_scale=quant_info.w13_scales,
+        w2_scale=quant_info.w2_scales,
+        g_idx1=quant_info.w13_g_idx,
+        g_idx2=quant_info.w2_g_idx,
+        sort_indices1=quant_info.w13_g_idx_sort_indices,
+        sort_indices2=quant_info.w2_g_idx_sort_indices,
+        w1_zeros=quant_info.w13_qzeros,
+        w2_zeros=quant_info.w2_qzeros,
+        workspace=MARLIN_MOE_WORKSPACE,
+        num_bits=quant_info.weight_bits,
+        is_k_full=quant_info.is_k_full,
+        clamp_limit=runner_config.swiglu_limit,
+    ).to(original_dtype)
+
+    if (
+        runner_config.routed_scaling_factor is not None
+        and runner_config.routed_scaling_factor != 1.0
+    ):
+        topk_weights = topk_weights * runner_config.routed_scaling_factor
+
+    return NixlEPCombineInput(
+        hidden_states=output,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
